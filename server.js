@@ -1,59 +1,82 @@
 const express = require("express");
 const cors = require("cors");
 const twilio = require("twilio");
+const http = require("http");
+const { Server } = require("socket.io");
 require("dotenv").config();
 
 const app = express();
-
 app.use(cors());
 app.use(express.json());
 
+// ==========================
+// SERVER + SOCKET
+// ==========================
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+  },
+});
+
+// ==========================
+// TWILIO CLIENT
+// ==========================
 const client = twilio(
   process.env.TWILIO_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// ==========================
-// BASE URL (RENDER SAFE)
-// ==========================
-const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+const BASE_URL = process.env.BASE_URL;
 
 // ==========================
-// ACTIVE CALL STORAGE
+// MEMORY STORAGE
 // ==========================
 const activeCallsByNumber = {};
 const calls = {};
 
 // ==========================
-// HEALTH CHECK (IMPORTANT)
+// SOCKET CONNECTION
 // ==========================
-app.get("/", (req, res) => {
-  res.json({ status: "backend alive" });
+io.on("connection", (socket) => {
+  console.log("🔌 Client connected:", socket.id);
+
+  socket.on("disconnect", () => {
+    console.log("❌ Client disconnected:", socket.id);
+  });
 });
 
 // ==========================
-// TWIML (FIXED FOR PRODUCTION)
+// HEALTH CHECK
 // ==========================
-// 🔥 FIX: supports BOTH GET and POST
+app.get("/", (req, res) => {
+  res.json({ status: "backend alive with websockets" });
+});
+
+// ==========================
+// TWIML ROUTE
+// ==========================
 app.all("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
   const to = req.body.To || req.query.To;
 
-  const dial = twiml.dial();
-
-  if (to) {
-    dial.number(to);
-  } else {
-    twiml.say("Connecting your call");
+  if (!to) {
+    twiml.say("Invalid call");
+    res.type("text/xml");
+    return res.send(twiml.toString());
   }
+
+  const dial = twiml.dial();
+  dial.number(to);
 
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
 // ==========================
-// START CALL (PRODUCTION SAFE)
+// START CALL
 // ==========================
 app.post("/call", async (req, res) => {
   const { to } = req.body;
@@ -65,15 +88,15 @@ app.post("/call", async (req, res) => {
   // prevent duplicates
   if (activeCallsByNumber[to]) {
     return res.json({
-      success: false,
-      error: "Call already in progress",
+      success: true,
       callSid: activeCallsByNumber[to],
+      reused: true,
     });
   }
 
   try {
     const call = await client.calls.create({
-      url: `${BASE_URL}/voice`,
+      url: `${BASE_URL}/voice?To=${encodeURIComponent(to)}`,
       to,
       from: process.env.TWILIO_NUMBER,
 
@@ -86,34 +109,34 @@ app.post("/call", async (req, res) => {
 
     calls[call.sid] = {
       to,
-      status: "initiated",
+      status: "calling",
     };
 
-    console.log("CALL CREATED:", call.sid);
+    io.emit("call_started", {
+      callSid: call.sid,
+      to,
+      status: "calling",
+    });
 
     return res.json({
       success: true,
       callSid: call.sid,
     });
 
-  } catch (err) {
-    console.error("CALL ERROR:", err.message);
-
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+  } catch (e) {
+    console.error("CALL ERROR:", e.message);
+    return res.status(500).json({ success: false, error: e.message });
   }
 });
 
 // ==========================
-// END CALL (REAL TERMINATION)
+// END CALL
 // ==========================
 app.post("/end-call", async (req, res) => {
   const { callSid } = req.body;
 
   if (!callSid) {
-    return res.status(400).json({ success: false, error: "Missing callSid" });
+    return res.status(400).json({ success: false });
   }
 
   try {
@@ -125,51 +148,74 @@ app.post("/end-call", async (req, res) => {
 
     if (call) {
       delete activeCallsByNumber[call.to];
-      calls[callSid].status = "completed";
+      call.status = "ended";
     }
 
-    console.log("CALL ENDED:", callSid);
+    io.emit("call_ended", {
+      callSid,
+      status: "ended",
+    });
 
     return res.json({ success: true });
 
-  } catch (err) {
-    console.error("END CALL ERROR:", err.message);
-
-    return res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+  } catch (e) {
+    console.error("END CALL ERROR:", e.message);
+    return res.status(500).json({ success: false });
   }
 });
 
 // ==========================
-// STATUS WEBHOOK
+// STATUS WEBHOOK (NORMALIZED)
 // ==========================
 app.post("/status", (req, res) => {
-  const callSid = req.body.CallSid;
-  const status = req.body.CallStatus;
+  const { CallSid, CallStatus } = req.body;
 
-  console.log("STATUS:", callSid, status);
+  if (calls[CallSid]) {
+    calls[CallSid].status = CallStatus;
 
-  if (calls[callSid]) {
-    calls[callSid].status = status;
-
-    if (status === "completed") {
-      const to = calls[callSid].to;
+    if (CallStatus === "completed") {
+      const to = calls[CallSid].to;
       delete activeCallsByNumber[to];
     }
   }
+
+  // normalize for frontend
+  let status = "calling";
+
+  switch (CallStatus) {
+    case "initiated":
+      status = "calling";
+      break;
+    case "ringing":
+      status = "ringing";
+      break;
+    case "in-progress":
+    case "answered":
+      status = "connected";
+      break;
+    case "completed":
+      status = "ended";
+      break;
+    case "failed":
+      status = "failed";
+      break;
+  }
+
+  io.emit("call_status", {
+    callSid: CallSid,
+    status,
+  });
 
   res.sendStatus(200);
 });
 
 // ==========================
-// GET CALL STATUS
+// STATUS API (fallback)
 // ==========================
 app.get("/call-status/:sid", (req, res) => {
   const sid = req.params.sid;
 
-  return res.json({
+  res.json({
     status: calls[sid]?.status || "unknown",
   });
 });
@@ -179,6 +225,6 @@ app.get("/call-status/:sid", (req, res) => {
 // ==========================
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 WebSocket + Twilio server running on port ${PORT}`);
 });
