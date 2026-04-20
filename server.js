@@ -14,29 +14,46 @@ const client = twilio(
 );
 
 // ==========================
+// BASE URL (RENDER SAFE)
+// ==========================
+const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
+
+// ==========================
 // ACTIVE CALL STORAGE
 // ==========================
-
-// by phone number (prevents duplicates)
 const activeCallsByNumber = {};
-
-// by SID (status tracking)
 const calls = {};
 
 // ==========================
-// TWIML ENDPOINT (IMPORTANT FIX)
+// HEALTH CHECK (IMPORTANT)
 // ==========================
-app.post("/voice", (req, res) => {
+app.get("/", (req, res) => {
+  res.json({ status: "backend alive" });
+});
+
+// ==========================
+// TWIML (FIXED FOR PRODUCTION)
+// ==========================
+// 🔥 FIX: supports BOTH GET and POST
+app.all("/voice", (req, res) => {
   const twiml = new twilio.twiml.VoiceResponse();
 
-  twiml.say("Connecting your call");
+  const to = req.body.To || req.query.To;
+
+  const dial = twiml.dial();
+
+  if (to) {
+    dial.number(to);
+  } else {
+    twiml.say("Connecting your call");
+  }
 
   res.type("text/xml");
   res.send(twiml.toString());
 });
 
 // ==========================
-// START CALL
+// START CALL (PRODUCTION SAFE)
 // ==========================
 app.post("/call", async (req, res) => {
   const { to } = req.body;
@@ -45,7 +62,7 @@ app.post("/call", async (req, res) => {
     return res.status(400).json({ success: false, error: "Missing number" });
   }
 
-  // 🚨 BLOCK DUPLICATE CALLS (CRITICAL FIX)
+  // prevent duplicates
   if (activeCallsByNumber[to]) {
     return res.json({
       success: false,
@@ -56,18 +73,17 @@ app.post("/call", async (req, res) => {
 
   try {
     const call = await client.calls.create({
-      url: `http://${process.env.HOST || "YOUR_SERVER_IP"}:3000/voice`,
+      url: `${BASE_URL}/voice`,
       to,
       from: process.env.TWILIO_NUMBER,
 
-      // 🔥 REAL-TIME STATUS TRACKING
-      statusCallback: `http://${process.env.HOST || "YOUR_SERVER_IP"}:3000/status`,
+      statusCallback: `${BASE_URL}/status`,
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       statusCallbackMethod: "POST",
     });
 
-    // store mappings
     activeCallsByNumber[to] = call.sid;
+
     calls[call.sid] = {
       to,
       status: "initiated",
@@ -91,7 +107,7 @@ app.post("/call", async (req, res) => {
 });
 
 // ==========================
-// END CALL (PRODUCTION SAFE)
+// END CALL (REAL TERMINATION)
 // ==========================
 app.post("/end-call", async (req, res) => {
   const { callSid } = req.body;
@@ -112,6 +128,8 @@ app.post("/end-call", async (req, res) => {
       calls[callSid].status = "completed";
     }
 
+    console.log("CALL ENDED:", callSid);
+
     return res.json({ success: true });
 
   } catch (err) {
@@ -125,7 +143,7 @@ app.post("/end-call", async (req, res) => {
 });
 
 // ==========================
-// TWILIO STATUS WEBHOOK
+// STATUS WEBHOOK
 // ==========================
 app.post("/status", (req, res) => {
   const callSid = req.body.CallSid;
@@ -136,7 +154,6 @@ app.post("/status", (req, res) => {
   if (calls[callSid]) {
     calls[callSid].status = status;
 
-    // auto cleanup
     if (status === "completed") {
       const to = calls[callSid].to;
       delete activeCallsByNumber[to];
@@ -160,6 +177,8 @@ app.get("/call-status/:sid", (req, res) => {
 // ==========================
 // START SERVER
 // ==========================
-app.listen(3000, "0.0.0.0", () => {
-  console.log("🚀 Production server running on port 3000");
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
