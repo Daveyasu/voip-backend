@@ -46,36 +46,41 @@ app.get("/", (req, res) => {
 });
 
 // ==========================
-// TWIML (FIXED - NO ERROR MESSAGE)
+// TWIML (FIXED - STABLE)
 // ==========================
 app.all("/voice", (req, res) => {
   try {
     const twiml = new twilio.twiml.VoiceResponse();
 
-    const to = req.body.To || req.query.To;
+    // ✅ ALWAYS use query param only (Twilio-safe)
+    const to = req.query.To;
 
     if (!to) {
+      console.log("❌ Missing To param");
       twiml.say("Invalid number");
       res.type("text/xml");
       return res.send(twiml.toString());
     }
 
+    console.log("📞 Dialing:", to);
+
     const dial = twiml.dial({
-      answerOnBridge: true, // IMPORTANT FOR STATUS SYNC
+      answerOnBridge: true,
     });
 
     dial.number(to);
 
     res.type("text/xml");
-    res.send(twiml.toString());
+    return res.send(twiml.toString());
+
   } catch (err) {
-    console.error("VOICE ERROR:", err.message);
+    console.error("VOICE ERROR:", err);
 
     const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say("Call failed due to server error");
+    twiml.say("We are experiencing technical issues");
 
     res.type("text/xml");
-    res.send(twiml.toString());
+    return res.send(twiml.toString());
   }
 });
 
@@ -107,8 +112,11 @@ app.post("/call", async (req, res) => {
       statusCallbackEvent: [
         "initiated",
         "ringing",
-        "answered",
+        "in-progress",
         "completed",
+        "busy",
+        "no-answer",
+        "failed",
       ],
       statusCallbackMethod: "POST",
     });
@@ -169,7 +177,7 @@ app.post("/end-call", async (req, res) => {
 });
 
 // ==========================
-// STATUS WEBHOOK (FINAL FIXED)
+// STATUS WEBHOOK (FINAL CLEAN)
 // ==========================
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus } = req.body;
@@ -193,15 +201,14 @@ app.post("/status", (req, res) => {
       status = "ringing";
       break;
     case "in-progress":
-    case "answered":
       status = "connected";
       break;
     case "completed":
       status = "ended";
       break;
-    case "failed":
     case "busy":
     case "no-answer":
+    case "failed":
       status = "failed";
       break;
   }
@@ -227,8 +234,6 @@ app.get("/call-status/:sid", (req, res) => {
   });
 });
 
-// ==========================
-// START SERVER
 // ==========================
 const PORT = process.env.PORT || 3000;
 
