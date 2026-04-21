@@ -2,6 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const twilio = require("twilio");
 const http = require("http");
+const mongoose = require("mongoose");
 const { Server } = require("socket.io");
 require("dotenv").config();
 
@@ -27,13 +28,28 @@ const client = twilio(
 
 const BASE_URL = process.env.BASE_URL;
 const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
+const MONGODB_URI = process.env.MONGODB_URI;
 
 // ==========================
 // MEMORY
 // ==========================
 const activeCallsByNumber = {};
 const pendingCallsByNumber = new Set();
-const calls = {};
+
+const callLogSchema = new mongoose.Schema(
+  {
+    callSid: { type: String, unique: true, index: true, required: true },
+    to: { type: String, required: true, index: true },
+    status: { type: String, default: "calling", index: true },
+    rawStatus: { type: String, default: "initiated" },
+    callType: { type: String, enum: ["missed", "completed"], default: "missed" },
+    duration: { type: Number, default: 0 },
+    timestamp: { type: Date, default: Date.now, index: true },
+  },
+  { timestamps: true }
+);
+
+const CallLog = mongoose.model("CallLog", callLogSchema);
 
 function normalizeNumber(input) {
   if (!input) return "";
@@ -46,6 +62,31 @@ function normalizeNumber(input) {
 
 function isValidPhoneNumber(input) {
   return /^\+?[0-9]{8,15}$/.test(input);
+}
+
+function mapCallStatus(rawStatus) {
+  switch (rawStatus) {
+    case "initiated":
+      return "calling";
+    case "ringing":
+      return "ringing";
+    case "answered":
+    case "in-progress":
+      return "connected";
+    case "completed":
+    case "canceled":
+      return "ended";
+    case "busy":
+    case "no-answer":
+    case "failed":
+      return "failed";
+    default:
+      return "calling";
+  }
+}
+
+function isTerminalStatus(rawStatus) {
+  return ["completed", "busy", "no-answer", "failed", "canceled"].includes(rawStatus);
 }
 
 // ==========================
@@ -138,10 +179,15 @@ app.post("/call", async (req, res) => {
 
     activeCallsByNumber[to] = call.sid;
 
-    calls[call.sid] = {
+    await CallLog.create({
+      callSid: call.sid,
       to,
       status: "calling",
-    };
+      rawStatus: "initiated",
+      callType: "missed",
+      duration: 0,
+      timestamp: new Date(),
+    });
 
     io.emit("call_started", {
       callSid: call.sid,
@@ -176,11 +222,20 @@ app.post("/end-call", async (req, res) => {
       status: "completed",
     });
 
-    const call = calls[callSid];
+    const call = await CallLog.findOne({ callSid }).lean();
 
     if (call) {
       delete activeCallsByNumber[call.to];
-      call.status = "ended";
+      await CallLog.updateOne(
+        { callSid },
+        {
+          $set: {
+            status: "ended",
+            rawStatus: "completed",
+            callType: "completed",
+          },
+        }
+      );
     }
 
     io.emit("call_ended", {
@@ -200,44 +255,40 @@ app.post("/end-call", async (req, res) => {
 // STATUS WEBHOOK (FINAL CLEAN)
 // ==========================
 app.post("/status", (req, res) => {
-  const { CallSid, CallStatus } = req.body;
+  const { CallSid, CallStatus, To, CallDuration } = req.body;
   if (!CallSid || !CallStatus) {
     console.log("⚠️ STATUS webhook missing fields:", req.body);
     return res.sendStatus(200);
   }
 
-  if (calls[CallSid]) {
-    calls[CallSid].status = CallStatus;
+  const status = mapCallStatus(CallStatus);
+  const parsedDuration = Number.parseInt(CallDuration || "0", 10);
+  const duration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
 
-    if (["completed", "busy", "no-answer", "failed", "canceled"].includes(CallStatus)) {
-      const to = calls[CallSid].to;
-      delete activeCallsByNumber[to];
-    }
-  }
-
-  let status = "calling";
-
-  switch (CallStatus) {
-    case "initiated":
-      status = "calling";
-      break;
-    case "ringing":
-      status = "ringing";
-      break;
-    case "answered":
-    case "in-progress":
-      status = "connected";
-      break;
-    case "completed":
-    case "canceled":
-      status = "ended";
-      break;
-    case "busy":
-    case "no-answer":
-    case "failed":
-      status = "failed";
-      break;
-  }
+  CallLog.findOneAndUpdate(
+    { callSid: CallSid },
+    {
+      $set: {
+        status,
+        rawStatus: CallStatus,
+        duration,
+        callType: status === "ended" && duration > 0 ? "completed" : "missed",
+      },
+      $setOnInsert: {
+        to: normalizeNumber(To || ""),
+        timestamp: new Date(),
+      },
+    },
+    { upsert: true, new: true }
+  )
+    .then((updatedCall) => {
+      if (updatedCall && isTerminalStatus(CallStatus)) {
+        delete activeCallsByNumber[updatedCall.to];
+      }
+    })
+    .catch((err) => {
+      console.error("STATUS DB ERROR:", err.message);
+    });
 
   console.log("📡 STATUS:", CallStatus, "→", status);
 
@@ -254,15 +305,66 @@ app.post("/status", (req, res) => {
 // ==========================
 app.get("/call-status/:sid", (req, res) => {
   const sid = req.params.sid;
+  CallLog.findOne({ callSid: sid })
+    .select("status")
+    .lean()
+    .then((call) => {
+      res.json({
+        status: call?.status || "unknown",
+      });
+    })
+    .catch((err) => {
+      console.error("CALL STATUS ERROR:", err.message);
+      res.status(500).json({ status: "unknown" });
+    });
+});
 
-  res.json({
-    status: calls[sid]?.status || "unknown",
-  });
+// ==========================
+// RECENTS API
+// ==========================
+app.get("/recents", async (req, res) => {
+  const limitRaw = Number.parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 30;
+
+  try {
+    const recents = await CallLog.find({})
+      .sort({ timestamp: -1 })
+      .limit(limit)
+      .select("to status callType duration timestamp")
+      .lean();
+
+    return res.json({
+      success: true,
+      recents: recents.map((item) => ({
+        number: item.to,
+        status: item.status,
+        type: item.callType,
+        duration: item.duration || 0,
+        timestamp: item.timestamp,
+      })),
+    });
+  } catch (e) {
+    console.error("RECENTS ERROR:", e.message);
+    return res.status(500).json({ success: false, recents: [] });
+  }
 });
 
 // ==========================
 const PORT = process.env.PORT || 3000;
+if (!MONGODB_URI) {
+  console.error("❌ Missing MONGODB_URI in environment");
+  process.exit(1);
+}
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+mongoose
+  .connect(MONGODB_URI)
+  .then(() => {
+    console.log("✅ MongoDB connected");
+    server.listen(PORT, "0.0.0.0", () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("❌ MongoDB connection failed:", err.message);
+    process.exit(1);
+  });
