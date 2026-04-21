@@ -15,6 +15,9 @@ const io = new Server(server, {
   cors: { origin: "*" },
 });
 
+// ==========================
+// TWILIO
+// ==========================
 const client = twilio(
   process.env.TWILIO_SID,
   process.env.TWILIO_AUTH_TOKEN
@@ -22,6 +25,9 @@ const client = twilio(
 
 const BASE_URL = process.env.BASE_URL;
 
+// ==========================
+// MEMORY
+// ==========================
 const activeCallsByNumber = {};
 const calls = {};
 
@@ -40,7 +46,7 @@ app.get("/", (req, res) => {
 });
 
 // ==========================
-// TWIML (FIXED - NO MORE ERROR)
+// TWIML (FIXED - NO ERROR MESSAGE)
 // ==========================
 app.all("/voice", (req, res) => {
   try {
@@ -55,19 +61,18 @@ app.all("/voice", (req, res) => {
     }
 
     const dial = twiml.dial({
-      answerOnBridge: true,
+      answerOnBridge: true, // IMPORTANT FOR STATUS SYNC
     });
 
     dial.number(to);
 
     res.type("text/xml");
     res.send(twiml.toString());
-
   } catch (err) {
     console.error("VOICE ERROR:", err.message);
 
     const twiml = new twilio.twiml.VoiceResponse();
-    twiml.say("Application error");
+    twiml.say("Call failed due to server error");
 
     res.type("text/xml");
     res.send(twiml.toString());
@@ -102,7 +107,7 @@ app.post("/call", async (req, res) => {
       statusCallbackEvent: [
         "initiated",
         "ringing",
-        "in-progress",
+        "answered",
         "completed",
       ],
       statusCallbackMethod: "POST",
@@ -139,7 +144,9 @@ app.post("/end-call", async (req, res) => {
   const { callSid } = req.body;
 
   try {
-    await client.calls(callSid).update({ status: "completed" });
+    await client.calls(callSid).update({
+      status: "completed",
+    });
 
     const call = calls[callSid];
 
@@ -162,7 +169,7 @@ app.post("/end-call", async (req, res) => {
 });
 
 // ==========================
-// STATUS WEBHOOK (FIXED LOGIC)
+// STATUS WEBHOOK (FINAL FIXED)
 // ==========================
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus } = req.body;
@@ -186,6 +193,7 @@ app.post("/status", (req, res) => {
       status = "ringing";
       break;
     case "in-progress":
+    case "answered":
       status = "connected";
       break;
     case "completed":
@@ -220,8 +228,10 @@ app.get("/call-status/:sid", (req, res) => {
 });
 
 // ==========================
+// START SERVER
+// ==========================
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 WebSocket + Twilio server running on ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
