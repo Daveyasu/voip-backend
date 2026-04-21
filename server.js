@@ -126,6 +126,7 @@ app.post("/call", async (req, res) => {
       statusCallbackEvent: [
         "initiated",
         "ringing",
+        "answered",
         "in-progress",
         "completed",
         "busy",
@@ -223,10 +224,12 @@ app.post("/status", (req, res) => {
     case "ringing":
       status = "ringing";
       break;
+    case "answered":
     case "in-progress":
       status = "connected";
       break;
     case "completed":
+    case "canceled":
       status = "ended";
       break;
     case "busy":
