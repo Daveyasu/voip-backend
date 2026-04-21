@@ -6,13 +6,14 @@ const { Server } = require("socket.io");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());
+const allowedOrigin = process.env.CORS_ORIGIN || "*";
+app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: { origin: allowedOrigin },
 });
 
 // ==========================
@@ -24,12 +25,27 @@ const client = twilio(
 );
 
 const BASE_URL = process.env.BASE_URL;
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
 
 // ==========================
 // MEMORY
 // ==========================
 const activeCallsByNumber = {};
+const pendingCallsByNumber = new Set();
 const calls = {};
+
+function normalizeNumber(input) {
+  if (!input) return "";
+  const value = String(input).trim();
+  if (value.startsWith("+")) {
+    return `+${value.slice(1).replace(/\D/g, "")}`;
+  }
+  return value.replace(/\D/g, "");
+}
+
+function isValidPhoneNumber(input) {
+  return /^\+?[0-9]{8,15}$/.test(input);
+}
 
 // ==========================
 // SOCKET
@@ -88,10 +104,18 @@ app.all("/voice", (req, res) => {
 // START CALL
 // ==========================
 app.post("/call", async (req, res) => {
-  const { to } = req.body;
+  const to = normalizeNumber(req.body?.to);
 
-  if (!to) {
-    return res.status(400).json({ success: false });
+  if (!to || !isValidPhoneNumber(to)) {
+    return res.status(400).json({ success: false, error: "Invalid phone number" });
+  }
+
+  if (!BASE_URL || !TWILIO_NUMBER) {
+    return res.status(500).json({ success: false, error: "Server not configured" });
+  }
+
+  if (pendingCallsByNumber.has(to)) {
+    return res.status(409).json({ success: false, error: "Call already starting" });
   }
 
   if (activeCallsByNumber[to]) {
@@ -102,11 +126,13 @@ app.post("/call", async (req, res) => {
     });
   }
 
+  pendingCallsByNumber.add(to);
+
   try {
     const call = await client.calls.create({
       url: `${BASE_URL}/voice?To=${encodeURIComponent(to)}`,
       to,
-      from: process.env.TWILIO_NUMBER,
+      from: TWILIO_NUMBER,
 
       statusCallback: `${BASE_URL}/status`,
       statusCallbackEvent: [
@@ -142,6 +168,8 @@ app.post("/call", async (req, res) => {
   } catch (e) {
     console.error("CALL ERROR:", e.message);
     return res.status(500).json({ success: false, error: e.message });
+  } finally {
+    pendingCallsByNumber.delete(to);
   }
 });
 
@@ -149,7 +177,10 @@ app.post("/call", async (req, res) => {
 // END CALL
 // ==========================
 app.post("/end-call", async (req, res) => {
-  const { callSid } = req.body;
+  const callSid = String(req.body?.callSid || "").trim();
+  if (!callSid) {
+    return res.status(400).json({ success: false, error: "callSid is required" });
+  }
 
   try {
     await client.calls(callSid).update({
@@ -181,11 +212,14 @@ app.post("/end-call", async (req, res) => {
 // ==========================
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus } = req.body;
+  if (!CallSid || !CallStatus) {
+    return res.sendStatus(200);
+  }
 
   if (calls[CallSid]) {
     calls[CallSid].status = CallStatus;
 
-    if (CallStatus === "completed") {
+    if (["completed", "busy", "no-answer", "failed", "canceled"].includes(CallStatus)) {
       const to = calls[CallSid].to;
       delete activeCallsByNumber[to];
     }
