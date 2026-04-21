@@ -9,6 +9,7 @@ const app = express();
 const allowedOrigin = process.env.CORS_ORIGIN || "*";
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 const server = http.createServer(app);
 
@@ -67,24 +68,11 @@ app.get("/", (req, res) => {
 app.all("/voice", (req, res) => {
   try {
     const twiml = new twilio.twiml.VoiceResponse();
-
-    // ✅ ALWAYS use query param only (Twilio-safe)
-    const to = req.query.To;
-
-    if (!to) {
-      console.log("❌ Missing To param");
-      twiml.say("Invalid number");
-      res.type("text/xml");
-      return res.send(twiml.toString());
-    }
-
-    console.log("📞 Dialing:", to);
-
-    const dial = twiml.dial({
-      answerOnBridge: true,
-    });
-
-    dial.number(to);
+    // Do not dial the destination again here.
+    // Twilio already called the destination in client.calls.create().
+    // Redialing in this TwiML causes the "second call" behavior.
+    twiml.say("Call connected.");
+    twiml.pause({ length: 600 });
 
     res.type("text/xml");
     return res.send(twiml.toString());
@@ -213,6 +201,7 @@ app.post("/end-call", async (req, res) => {
 app.post("/status", (req, res) => {
   const { CallSid, CallStatus } = req.body;
   if (!CallSid || !CallStatus) {
+    console.log("⚠️ STATUS webhook missing fields:", req.body);
     return res.sendStatus(200);
   }
 
