@@ -39,17 +39,41 @@ const pendingCallsByNumber = new Set();
 const callLogSchema = new mongoose.Schema(
   {
     callSid: { type: String, unique: true, index: true, required: true },
+    userId: { type: String, index: true },
     to: { type: String, required: true, index: true },
     status: { type: String, default: "calling", index: true },
     rawStatus: { type: String, default: "initiated" },
     callType: { type: String, enum: ["missed", "completed"], default: "missed" },
     duration: { type: Number, default: 0 },
+    ratePerMinute: { type: Number, default: 0 },
+    billedMinutes: { type: Number, default: 0 },
+    chargeAmount: { type: Number, default: 0 },
+    isCharged: { type: Boolean, default: false },
     timestamp: { type: Date, default: Date.now, index: true },
   },
   { timestamps: true }
 );
 
 const CallLog = mongoose.model("CallLog", callLogSchema);
+
+const userSchema = new mongoose.Schema(
+  {
+    userId: { type: String, unique: true, index: true, required: true },
+    balance: { type: Number, default: 5 },
+  },
+  { timestamps: true }
+);
+const User = mongoose.model("User", userSchema);
+
+const rateSchema = new mongoose.Schema(
+  {
+    prefix: { type: String, unique: true, index: true, required: true },
+    label: { type: String, required: true },
+    ratePerMinute: { type: Number, required: true },
+  },
+  { timestamps: true }
+);
+const Rate = mongoose.model("Rate", rateSchema);
 
 function normalizeNumber(input) {
   if (!input) return "";
@@ -87,6 +111,28 @@ function mapCallStatus(rawStatus) {
 
 function isTerminalStatus(rawStatus) {
   return ["completed", "busy", "no-answer", "failed", "canceled"].includes(rawStatus);
+}
+
+async function ensureUser(userId) {
+  return User.findOneAndUpdate(
+    { userId },
+    { $setOnInsert: { userId, balance: 5 } },
+    { upsert: true, new: true }
+  );
+}
+
+async function getRateForNumber(to) {
+  const normalized = normalizeNumber(to);
+  const rates = await Rate.find({}).select("prefix label ratePerMinute").lean();
+  let best = null;
+  for (const rate of rates) {
+    if (normalized.startsWith(rate.prefix)) {
+      if (!best || rate.prefix.length > best.prefix.length) {
+        best = rate;
+      }
+    }
+  }
+  return best;
 }
 
 // ==========================
@@ -134,9 +180,13 @@ app.all("/voice", (req, res) => {
 // ==========================
 app.post("/call", async (req, res) => {
   const to = normalizeNumber(req.body?.to);
+  const userId = String(req.body?.userId || "").trim();
 
   if (!to || !isValidPhoneNumber(to)) {
     return res.status(400).json({ success: false, error: "Invalid phone number" });
+  }
+  if (!userId) {
+    return res.status(400).json({ success: false, error: "userId is required" });
   }
 
   if (!BASE_URL || !TWILIO_NUMBER) {
@@ -158,6 +208,19 @@ app.post("/call", async (req, res) => {
   pendingCallsByNumber.add(to);
 
   try {
+    const [user, rate] = await Promise.all([ensureUser(userId), getRateForNumber(to)]);
+    if (!rate) {
+      return res.status(400).json({ success: false, error: "No rate configured for destination" });
+    }
+    if (user.balance < rate.ratePerMinute) {
+      return res.status(402).json({
+        success: false,
+        error: "Insufficient balance",
+        balance: user.balance,
+        ratePerMinute: rate.ratePerMinute,
+      });
+    }
+
     const call = await client.calls.create({
       url: `${BASE_URL}/voice?To=${encodeURIComponent(to)}`,
       to,
@@ -181,11 +244,13 @@ app.post("/call", async (req, res) => {
 
     await CallLog.create({
       callSid: call.sid,
+      userId,
       to,
       status: "calling",
       rawStatus: "initiated",
       callType: "missed",
       duration: 0,
+      ratePerMinute: rate.ratePerMinute,
       timestamp: new Date(),
     });
 
@@ -198,6 +263,8 @@ app.post("/call", async (req, res) => {
     return res.json({
       success: true,
       callSid: call.sid,
+      ratePerMinute: rate.ratePerMinute,
+      balance: user.balance,
     });
 
   } catch (e) {
@@ -254,7 +321,7 @@ app.post("/end-call", async (req, res) => {
 // ==========================
 // STATUS WEBHOOK (FINAL CLEAN)
 // ==========================
-app.post("/status", (req, res) => {
+app.post("/status", async (req, res) => {
   const { CallSid, CallStatus, To, CallDuration } = req.body;
   if (!CallSid || !CallStatus) {
     console.log("⚠️ STATUS webhook missing fields:", req.body);
@@ -265,30 +332,42 @@ app.post("/status", (req, res) => {
   const parsedDuration = Number.parseInt(CallDuration || "0", 10);
   const duration = Number.isFinite(parsedDuration) ? parsedDuration : 0;
 
-  CallLog.findOneAndUpdate(
-    { callSid: CallSid },
-    {
-      $set: {
-        status,
-        rawStatus: CallStatus,
-        duration,
-        callType: status === "ended" && duration > 0 ? "completed" : "missed",
+  try {
+    const updatedCall = await CallLog.findOneAndUpdate(
+      { callSid: CallSid },
+      {
+        $set: {
+          status,
+          rawStatus: CallStatus,
+          duration,
+          callType: status === "ended" && duration > 0 ? "completed" : "missed",
+        },
+        $setOnInsert: {
+          to: normalizeNumber(To || ""),
+          timestamp: new Date(),
+        },
       },
-      $setOnInsert: {
-        to: normalizeNumber(To || ""),
-        timestamp: new Date(),
-      },
-    },
-    { upsert: true, new: true }
-  )
-    .then((updatedCall) => {
-      if (updatedCall && isTerminalStatus(CallStatus)) {
-        delete activeCallsByNumber[updatedCall.to];
-      }
-    })
-    .catch((err) => {
-      console.error("STATUS DB ERROR:", err.message);
-    });
+      { upsert: true, new: true }
+    );
+
+    if (updatedCall && isTerminalStatus(CallStatus)) {
+      delete activeCallsByNumber[updatedCall.to];
+    }
+
+    if (updatedCall && status === "ended" && !updatedCall.isCharged && updatedCall.userId) {
+      const billedMinutes = Math.max(1, Math.ceil(duration / 60));
+      const chargeAmount = billedMinutes * (updatedCall.ratePerMinute || 0);
+      await Promise.all([
+        User.updateOne({ userId: updatedCall.userId }, { $inc: { balance: -chargeAmount } }),
+        CallLog.updateOne(
+          { callSid: CallSid },
+          { $set: { isCharged: true, billedMinutes, chargeAmount } }
+        ),
+      ]);
+    }
+  } catch (err) {
+    console.error("STATUS DB ERROR:", err.message);
+  }
 
   console.log("📡 STATUS:", CallStatus, "→", status);
 
@@ -323,11 +402,15 @@ app.get("/call-status/:sid", (req, res) => {
 // RECENTS API
 // ==========================
 app.get("/recents", async (req, res) => {
+  const userId = String(req.query.userId || "").trim();
   const limitRaw = Number.parseInt(req.query.limit, 10);
   const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 30;
+  if (!userId) {
+    return res.status(400).json({ success: false, recents: [], error: "userId is required" });
+  }
 
   try {
-    const recents = await CallLog.find({})
+    const recents = await CallLog.find({ userId })
       .sort({ timestamp: -1 })
       .limit(limit)
       .select("to status callType duration timestamp")
@@ -350,6 +433,36 @@ app.get("/recents", async (req, res) => {
 });
 
 // ==========================
+// BILLING / ESTIMATE
+// ==========================
+app.get("/estimate", async (req, res) => {
+  const to = normalizeNumber(req.query.to);
+  const userId = String(req.query.userId || "").trim();
+  if (!to || !userId) {
+    return res.status(400).json({ success: false, error: "to and userId are required" });
+  }
+
+  try {
+    const [user, rate] = await Promise.all([ensureUser(userId), getRateForNumber(to)]);
+    if (!rate) {
+      return res.status(400).json({ success: false, error: "No rate configured for destination" });
+    }
+    const canCall = user.balance >= rate.ratePerMinute;
+    return res.json({
+      success: true,
+      userId,
+      balance: user.balance,
+      ratePerMinute: rate.ratePerMinute,
+      destination: rate.label,
+      canCall,
+    });
+  } catch (e) {
+    console.error("ESTIMATE ERROR:", e.message);
+    return res.status(500).json({ success: false, error: "Estimate failed" });
+  }
+});
+
+// ==========================
 const PORT = process.env.PORT || 3000;
 if (!MONGODB_URI) {
   console.error("❌ Missing MONGODB_URI in environment");
@@ -358,6 +471,23 @@ if (!MONGODB_URI) {
 
 mongoose
   .connect(MONGODB_URI)
+  .then(() => {
+    return Rate.countDocuments().then(async (count) => {
+      if (count === 0) {
+        await Rate.insertMany([
+          { prefix: "+1", label: "US/Canada", ratePerMinute: 0.05 },
+          { prefix: "+44", label: "United Kingdom", ratePerMinute: 0.08 },
+          { prefix: "+251", label: "Ethiopia", ratePerMinute: 0.12 },
+          { prefix: "+291", label: "Eritrea", ratePerMinute: 0.14 },
+          { prefix: "+91", label: "India", ratePerMinute: 0.04 },
+          { prefix: "+971", label: "UAE", ratePerMinute: 0.07 },
+          { prefix: "+49", label: "Germany", ratePerMinute: 0.06 },
+          { prefix: "+33", label: "France", ratePerMinute: 0.06 },
+        ]);
+        console.log("✅ Seeded default call rates");
+      }
+    });
+  })
   .then(() => {
     console.log("✅ MongoDB connected");
     server.listen(PORT, "0.0.0.0", () => {
